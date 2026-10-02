@@ -1,0 +1,655 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>thin-voice</title>
+<style>
+  :root {
+    --bg: #f7f7f5; --panel: #ffffff; --text: #1d1d1f; --muted: #6e6e73; --line: #e3e3e0;
+    --accent: #2f6fde; --user: #eef3fd; --live: #d93f3f; --stage: #dfe3ea;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #141416; --panel: #1d1d20; --text: #ececee; --muted: #9a9aa1; --line: #2c2c31;
+      --accent: #6b9cff; --user: #1f2a40; --live: #ff6b6b; --stage: #23262e;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  }
+  main { max-width: 640px; margin: 0 auto; padding: 32px 16px; display: grid; gap: 20px; }
+  header { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+  h1 { font-size: 18px; margin: 0; letter-spacing: -0.01em; }
+  #status { color: var(--muted); font-size: 13px; display: flex; align-items: center; gap: 8px; }
+  #dot { width: 9px; height: 9px; border-radius: 50%; background: var(--line); }
+  #dot.listening { background: var(--accent); }
+  #dot.speaking-user { background: var(--live); }
+  #dot.thinking { background: #e0a100; }
+  #dot.speaking { background: #2fa36b; }
+  #face {
+    position: relative; width: 100%; aspect-ratio: 4 / 3; border-radius: 16px; overflow: hidden;
+    background: radial-gradient(circle at 50% 30%, var(--panel), var(--stage));
+  }
+  #face[hidden] { display: none; }
+  #face-info { position: absolute; inset: auto 0 12px; text-align: center; color: var(--muted); font-size: 13px; }
+  .controls { display: flex; flex-wrap: wrap; align-items: center; gap: 16px; }
+  button {
+    font: inherit; font-weight: 600; border: 0; border-radius: 999px; padding: 10px 22px; cursor: pointer;
+    background: var(--accent); color: white;
+  }
+  button.stop { background: var(--panel); color: var(--text); border: 1px solid var(--line); }
+  label { color: var(--muted); font-size: 13px; display: flex; align-items: center; gap: 6px; }
+  select { font: inherit; font-size: 13px; color: var(--text); background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 4px 8px; }
+  #log { display: grid; gap: 10px; }
+  .message { padding: 10px 14px; border-radius: 12px; background: var(--panel); border: 1px solid var(--line); }
+  .message.user { background: var(--user); border-color: transparent; justify-self: end; max-width: 85%; }
+  .message.assistant { max-width: 90%; }
+  .timing { color: var(--muted); font-size: 12px; margin-top: 4px; font-variant-numeric: tabular-nums; }
+  .hint { color: var(--muted); font-size: 13px; margin: 0; }
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.180.0/build/three.module.js/+esm",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.180.0/examples/jsm/",
+    "talkinghead": "https://cdn.jsdelivr.net/npm/@met4citizen/talkinghead@1.7.0/modules/talkinghead.mjs",
+    "headaudio": "https://cdn.jsdelivr.net/npm/@met4citizen/headaudio@0.1.0/dist/headaudio.min.mjs",
+    "lam-renderer": "https://cdn.jsdelivr.net/npm/gaussian-splat-renderer-for-lam@0.0.9-alpha.2/build/gaussian-splat-renderer-for-lam.module.js"
+  }
+}
+</script>
+</head>
+<body>
+<main>
+  <header>
+    <h1>thin-voice</h1>
+    <div id="status"><span id="dot"></span><span id="status-text">Not started</span></div>
+  </header>
+  <div id="face"><div id="face-info"></div></div>
+  <div class="controls">
+    <button id="start">Start talking</button>
+    <label><input type="checkbox" id="barge-in" checked> Let me interrupt</label>
+    <select id="face-choice">
+      <option value="none">No face</option>
+      <option value="avaturn">3D character, female</option>
+      <option value="metaperson">3D character, male</option>
+    </select>
+  </div>
+  <p class="hint">Use headphones, or turn off interrupting, if the assistant keeps cutting itself off: that means the speakers are leaking into the microphone.</p>
+  <div id="log"></div>
+</main>
+
+<script type="module">
+import { HeadAudio } from "headaudio";
+
+// Collects 16 kHz microphone audio into 512-sample int16 frames, the unit the server's VAD works in.
+const CAPTURE_WORKLET = `
+class Capture extends AudioWorkletProcessor {
+  constructor() { super(); this.frame = new Int16Array(512); this.filled = 0; }
+  process([input]) {
+    const samples = input[0];
+    if (!samples) return true;
+    for (const sample of samples) {
+      this.frame[this.filled++] = Math.max(-1, Math.min(1, sample)) * 32767;
+      if (this.filled === this.frame.length) {
+        this.port.postMessage(this.frame.buffer, [this.frame.buffer]);
+        this.frame = new Int16Array(512);
+        this.filled = 0;
+      }
+    }
+    return true;
+  }
+}
+registerProcessor("capture", Capture);
+`;
+
+const HEADAUDIO = "https://cdn.jsdelivr.net/npm/@met4citizen/headaudio@0.1.0/dist/";
+// HeadAudio needs 50-100 ms to read a mouth shape from the audio, so the sound is held back to match the lips.
+const LIPSYNC_DELAY_SECONDS = 0.08;
+// Voices speak at a typical pitch below about 160 Hz when they sound male, above it when female.
+const VOICE_PITCH_BOUNDARY_HZ = 160;
+// No photo-real female head ships yet; make one with LAM and drop the zip into web/avatars/lam/.
+const DEFAULT_FACES = { male: "lam:james", female: "avaturn" };
+
+// Retarget and baseline values come from TalkingHead's siteconfig.js for these avatars.
+const CHARACTERS = {
+  avaturn: {
+    url: "/avatars/avaturn.glb",
+    body: "F",
+    avatarMood: "happy",
+    retarget: {
+      Hips: { y: 0.03 }, Spine: { y: 0.02 }, Spine1: { y: 0.02, z: 0.01 },
+      Spine2: { y: 0.02, z: 0.01 }, Neck: { z: 0.02, y: 0.01 }, Head: { z: 0.02 },
+      LeftShoulder: { rx: -0.5 }, RightShoulder: { rx: -0.5 },
+      scaleToHipsLevel: 1.0,
+    },
+    baseline: { headRotateX: -0.05, eyeBlinkLeft: 0.15, eyeBlinkRight: 0.15 },
+  },
+  metaperson: {
+    url: "/avatars/avatarsdk.glb",
+    body: "M",
+    avatarMood: "neutral",
+    retarget: {
+      Neck: { z: -0.01, rx: -0.15 }, Neck1: { z: -0.01, rx: -0.15 }, Neck2: { z: -0.01, rx: -0.15 },
+      LeftShoulder: { rz: -0.3 }, RightShoulder: { rz: 0.3 },
+      scaleToEyesLevel: 1.0, origin: { y: -0.1 },
+    },
+    baseline: { headRotateX: -0.04, eyeBlinkLeft: 0.05, eyeBlinkRight: 0.05 },
+  },
+};
+
+// How much each Oculus mouth shape that HeadAudio hears moves the ARKit face controls of a LAM head.
+const VISEME_TO_ARKIT = {
+  viseme_PP: { mouthClose: 0.6, mouthPressLeft: 0.5, mouthPressRight: 0.5, jawOpen: 0.05 },
+  viseme_FF: { mouthRollLower: 0.6, mouthUpperUpLeft: 0.25, mouthUpperUpRight: 0.25, jawOpen: 0.1 },
+  viseme_TH: { jawOpen: 0.2, mouthStretchLeft: 0.1, mouthStretchRight: 0.1 },
+  viseme_DD: { jawOpen: 0.25, mouthStretchLeft: 0.2, mouthStretchRight: 0.2 },
+  viseme_kk: { jawOpen: 0.3, mouthStretchLeft: 0.15, mouthStretchRight: 0.15 },
+  viseme_CH: { jawOpen: 0.2, mouthFunnel: 0.5, mouthPucker: 0.3 },
+  viseme_SS: { jawOpen: 0.1, mouthStretchLeft: 0.35, mouthStretchRight: 0.35, mouthSmileLeft: 0.15, mouthSmileRight: 0.15 },
+  viseme_nn: { jawOpen: 0.2, mouthStretchLeft: 0.1, mouthStretchRight: 0.1 },
+  viseme_RR: { jawOpen: 0.2, mouthFunnel: 0.35, mouthPucker: 0.25 },
+  viseme_aa: { jawOpen: 0.65, mouthLowerDownLeft: 0.3, mouthLowerDownRight: 0.3 },
+  viseme_E: { jawOpen: 0.4, mouthStretchLeft: 0.4, mouthStretchRight: 0.4, mouthSmileLeft: 0.15, mouthSmileRight: 0.15 },
+  viseme_I: { jawOpen: 0.25, mouthStretchLeft: 0.5, mouthStretchRight: 0.5, mouthSmileLeft: 0.3, mouthSmileRight: 0.3 },
+  viseme_O: { jawOpen: 0.45, mouthFunnel: 0.6, mouthPucker: 0.25 },
+  viseme_U: { jawOpen: 0.2, mouthPucker: 0.8, mouthFunnel: 0.35 },
+};
+
+// LAM heads carry their own idle, listening, thinking and speaking motion for these states.
+const LAM_STATES = { "": "Idle", listening: "Listening", "speaking-user": "Listening", thinking: "Thinking", speaking: "Responding" };
+
+const startButton = document.getElementById("start");
+const bargeIn = document.getElementById("barge-in");
+const faceChoice = document.getElementById("face-choice");
+const stage = document.getElementById("face");
+const faceInfo = document.getElementById("face-info");
+const log = document.getElementById("log");
+const dot = document.getElementById("dot");
+const statusText = document.getElementById("status-text");
+
+const config = await (await fetch("/config")).json();
+let socket, microphone, captureContext;
+// Where replies are played: the face's audio graph, or a plain context without a face.
+let playback = null;
+let nextPlayTime = 0;
+let pendingMetrics = null;
+let currentReply = null;
+let isPlaying = false;
+const playing = new Set();
+
+for (const name of config.lam_heads) faceChoice.add(new Option(`Photo-real head, ${name}`, `lam:${name}`));
+for (const name of config.pictures) faceChoice.add(new Option(`Animated picture, ${name}`, `picture:${name}`));
+const voiceIsMale = config.voice_pitch_hz <= VOICE_PITCH_BOUNDARY_HZ;
+const chosenFace = new URLSearchParams(location.search).get("face") ?? DEFAULT_FACES[voiceIsMale ? "male" : "female"];
+faceChoice.value = chosenFace;
+const face = await createFace(chosenFace).catch((error) => {
+  faceInfo.textContent = `The face failed to load: ${error.message}`;
+  return null;
+});
+
+/**
+ * A face exposes the audio context replies are played in, the node to play them into,
+ * how long it holds the sound back to match the lips, and a hook for conversation states.
+ */
+async function createFace(choice) {
+  if (choice === "none") {
+    stage.hidden = true;
+    return null;
+  }
+  if (choice.startsWith("lam:")) return photoRealFace(choice.slice("lam:".length));
+  if (choice.startsWith("picture:")) return pictureFace(choice.slice("picture:".length));
+  return characterFace(choice);
+}
+
+async function characterFace(name) {
+  const { TalkingHead } = await import("talkinghead");
+  const head = new TalkingHead(stage, {
+    ttsEndpoint: "N/A",
+    lipsyncModules: [],
+    cameraView: "upper",
+    cameraRotateEnable: false,
+    modelFPS: 30,
+    modelPixelRatio: window.devicePixelRatio,
+  });
+  faceInfo.textContent = "Loading face ...";
+  await head.showAvatar(CHARACTERS[name], showProgress);
+  faceInfo.textContent = "";
+
+  const lipSync = await createLipSync(head.audioCtx, head.audioSpeechGainNode, (key, value) =>
+    Object.assign(head.mtAvatar[key], { newvalue: value, needsUpdate: true }),
+  );
+  head.opt.update = lipSync.update.bind(lipSync);
+  const delay = new DelayNode(head.audioCtx, { delayTime: LIPSYNC_DELAY_SECONDS });
+  head.audioSpeechGainNode.disconnect(head.audioReverbNode);
+  head.audioSpeechGainNode.connect(delay).connect(head.audioReverbNode);
+
+  // Look at the listener and move the hands when a new sentence starts after a pause.
+  let lastEnded = 0;
+  lipSync.onended = () => (lastEnded = Date.now());
+  lipSync.onstarted = () => {
+    if (Date.now() - lastEnded > 150) {
+      head.lookAtCamera(500);
+      head.speakWithHands();
+    }
+  };
+
+  return {
+    context: head.audioCtx,
+    input: head.audioAnalyzerNode,
+    delay: LIPSYNC_DELAY_SECONDS,
+    start: () => head.start(),
+    setState: (state) => state === "speaking-user" && head.lookAtCamera(1000),
+  };
+}
+
+async function photoRealFace(name) {
+  const { GaussianSplatRenderer } = await import("lam-renderer");
+  const { context, speech } = speechGraph();
+  const visemes = {};
+  const lipSync = await createLipSync(context, speech, (key, value) => (visemes[key] = value));
+  const blink = blinker();
+  let state = LAM_STATES[""];
+  let lastFrame = performance.now();
+
+  faceInfo.textContent = "Loading face ...";
+  await GaussianSplatRenderer.getInstance(stage, `/avatars/lam/${name}.zip`, {
+    getChatState: () => state,
+    getExpressionData: () => {
+      const now = performance.now();
+      lipSync.update(now - lastFrame);
+      lastFrame = now;
+      const closed = blink(now);
+      return { ...arkitFromVisemes(visemes), eyeBlinkLeft: closed, eyeBlinkRight: closed };
+    },
+    downloadProgress: (fraction) => (faceInfo.textContent = `Loading face ${Math.round(fraction * 100)}%`),
+  });
+  faceInfo.textContent = "";
+
+  return {
+    context,
+    input: speech,
+    delay: LIPSYNC_DELAY_SECONDS,
+    start: () => {},
+    setState: (status) => (state = LAM_STATES[status]),
+  };
+}
+
+async function pictureFace(name) {
+  const rig = await (await fetch(`/avatars/pictures/${name}.json`)).json();
+  const image = new Image();
+  image.src = `/avatars/pictures/${rig.image}`;
+  await image.decode();
+  const canvas = document.createElement("canvas");
+  canvas.style.cssText = "display: block; width: 100%; height: 100%";
+  stage.append(canvas);
+
+  const { context, speech } = speechGraph();
+  const visemes = {};
+  const lipSync = await createLipSync(context, speech, (key, value) => (visemes[key] = value));
+  const blink = blinker();
+  const gaze = gazer();
+  const pose = { mouthOpen: 0, mouthWide: 0, gazeX: 0, gazeY: 0, blink: 0, breath: 0 };
+  let state = "";
+  let lastFrame = performance.now();
+
+  function frame(now) {
+    requestAnimationFrame(frame);
+    // 30 frames per second is plenty for a face and spares a weak GPU.
+    if (now - lastFrame < 33) return;
+    lipSync.update(now - lastFrame);
+    lastFrame = now;
+    const arkit = arkitFromVisemes(visemes);
+    const look = gaze(state, now);
+    pose.mouthOpen = approach(pose.mouthOpen, Math.min(1, (arkit.jawOpen ?? 0) * 1.5), 0.5);
+    pose.mouthWide = approach(pose.mouthWide, mouthWidth(arkit), 0.5);
+    pose.gazeX = approach(pose.gazeX, look.x, 0.35);
+    pose.gazeY = approach(pose.gazeY, look.y, 0.35);
+    pose.blink = blink(now);
+    pose.breath = Math.sin((now / 4500) * 2 * Math.PI);
+    canvas.width = canvas.clientWidth * window.devicePixelRatio;
+    canvas.height = canvas.clientHeight * window.devicePixelRatio;
+    drawPicture(canvas.getContext("2d"), image, rig, pose);
+  }
+  requestAnimationFrame(frame);
+
+  return {
+    context,
+    input: speech,
+    delay: LIPSYNC_DELAY_SECONDS,
+    start: () => {},
+    setState: (status) => (state = status),
+  };
+}
+
+// Draws the picture with its eyes, eyelids and mouth moved to `pose`. Rig coordinates are picture pixels.
+function drawPicture(ctx, image, rig, pose) {
+  const { width, height } = ctx.canvas;
+  // Show `frameHeight` picture pixels around the face, never less than the stage, and breathe by a few tenths of a percent.
+  const scale = Math.max(width / image.width, height / rig.frameHeight) * (1.02 + 0.003 * pose.breath);
+  const left = (width - image.width * scale) / 2;
+  const top = Math.min(0, Math.max(height - image.height * scale, height / 2 - rig.focusY * scale));
+  ctx.setTransform(scale, 0, 0, scale, left, top);
+  ctx.drawImage(image, 0, 0);
+  for (const eye of rig.eyes) drawEye(ctx, image, rig, eye, pose);
+  drawMouth(ctx, rig, pose);
+}
+
+function drawEye(ctx, image, rig, eye, pose) {
+  const { pupil } = eye;
+  ctx.save();
+  ellipsePath(ctx, eye, 2);
+  ctx.clip();
+
+  // Paint over the picture's pupil, then draw it where the gaze puts it.
+  ctx.fillStyle = rig.eyeWhite;
+  ellipsePath(ctx, pupil, 3);
+  ctx.fill();
+  const travelX = (extentX(eye) - extentX(pupil)) * 0.8;
+  const travelY = (extentY(eye) - extentY(pupil)) * 0.8;
+  ctx.fillStyle = rig.ink;
+  ellipsePath(ctx, { ...pupil, x: pupil.x + pose.gazeX * travelX, y: pupil.y + pose.gazeY * travelY });
+  ctx.fill();
+
+  if (pose.blink > 0) {
+    // The lids are the skin just above this eye. The upper one comes down further than the lower one comes up,
+    // so they meet two thirds of the way down, where the lash line shows a closed eye.
+    const halfWidth = extentX(eye) + 2;
+    const top = eye.y - extentY(eye) - 2;
+    const bottom = eye.y + extentY(eye) + 2;
+    const meet = top + (bottom - top) * 0.65;
+    const upperEdge = top + (meet - top) * pose.blink;
+    const lowerEdge = bottom - (bottom - meet) * pose.blink;
+    const skin = eye.lidSkin;
+    const paintSkin = (from, to) =>
+      ctx.drawImage(image, skin.x, skin.y, skin.width, skin.height, eye.x - halfWidth, from, 2 * halfWidth, to - from);
+    paintSkin(top, upperEdge);
+    paintSkin(lowerEdge, bottom);
+    const shade = ctx.createLinearGradient(0, top, 0, upperEdge);
+    shade.addColorStop(0, "rgba(0, 0, 0, 0)");
+    shade.addColorStop(1, "rgba(0, 0, 0, 0.3)");
+    ctx.fillStyle = shade;
+    ctx.fillRect(eye.x - halfWidth, top, 2 * halfWidth, upperEdge - top);
+    ctx.strokeStyle = rig.ink;
+    ctx.lineWidth = 4;
+    ctx.beginPath();
+    ctx.moveTo(eye.x - halfWidth, upperEdge - 6);
+    ctx.quadraticCurveTo(eye.x, upperEdge + 8, eye.x + halfWidth, upperEdge - 6);
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+
+function drawMouth(ctx, rig, pose) {
+  const { x, y, width, height } = rig.mouth;
+  if (pose.mouthOpen < 0.03 && pose.mouthWide < 0.03) return;
+  // Never narrower than the drawn slit, so the opening always covers it. The top edge stays on the slit
+  // and the jaw drops below it, which gives the flat-topped, round-bottomed mouth of a cartoon.
+  const halfWidth = (width / 2) * (1 + 0.25 * Math.max(0, pose.mouthWide));
+  const top = y - height / 2;
+  const drop = height + pose.mouthOpen * width * 0.5;
+  ctx.fillStyle = rig.ink;
+  ctx.beginPath();
+  ctx.moveTo(x - halfWidth, top + height / 2);
+  ctx.arc(x - halfWidth + height / 2, top + height / 2, height / 2, Math.PI, 1.5 * Math.PI);
+  ctx.lineTo(x + halfWidth - height / 2, top);
+  ctx.arc(x + halfWidth - height / 2, top + height / 2, height / 2, 1.5 * Math.PI, 2 * Math.PI);
+  ctx.ellipse(x, top + height / 2, halfWidth, drop - height / 2, 0, 0, Math.PI);
+  ctx.fill();
+}
+
+function ellipsePath(ctx, shape, grow = 0) {
+  ctx.beginPath();
+  ctx.ellipse(shape.x, shape.y, shape.rx + grow, shape.ry + grow, (shape.angle * Math.PI) / 180, 0, 2 * Math.PI);
+}
+
+// Half the width and half the height of the box around a rotated ellipse.
+function extentX({ rx, ry, angle }) {
+  const a = (angle * Math.PI) / 180;
+  return Math.hypot(rx * Math.cos(a), ry * Math.sin(a));
+}
+
+function extentY({ rx, ry, angle }) {
+  const a = (angle * Math.PI) / 180;
+  return Math.hypot(rx * Math.sin(a), ry * Math.cos(a));
+}
+
+// Where the eyes look, -1 to 1 on each axis: at you while listening and talking, up and away while thinking,
+// with a short glance aside every few seconds.
+function gazer() {
+  let glance = { x: 0, y: 0, until: 0 };
+  let nextGlance = performance.now() + 2000;
+  return (state, now) => {
+    if (state === "thinking") return { x: -0.5, y: -0.8 };
+    if (now > nextGlance) {
+      glance = { x: Math.random() * 1.2 - 0.6, y: Math.random() * 0.8 - 0.4, until: now + 500 };
+      nextGlance = now + 2000 + Math.random() * 3000;
+    }
+    return now < glance.until ? glance : { x: 0, y: 0 };
+  };
+}
+
+function mouthWidth(arkit) {
+  const stretch = ((arkit.mouthStretchLeft ?? 0) + (arkit.mouthStretchRight ?? 0)) / 2;
+  const smile = ((arkit.mouthSmileLeft ?? 0) + (arkit.mouthSmileRight ?? 0)) / 2;
+  const round = (arkit.mouthPucker ?? 0) + (arkit.mouthFunnel ?? 0) / 2;
+  return Math.max(-1, Math.min(1, stretch + smile / 2 - round));
+}
+
+function approach(current, target, rate) {
+  return current + (target - current) * rate;
+}
+
+// Replies play into `speech`, which feeds the lip-sync and, held back to match the lips, the speakers.
+function speechGraph() {
+  const context = new AudioContext();
+  const speech = new GainNode(context);
+  speech.connect(new DelayNode(context, { delayTime: LIPSYNC_DELAY_SECONDS })).connect(context.destination);
+  return { context, speech };
+}
+
+async function createLipSync(context, speech, onvalue) {
+  await context.audioWorklet.addModule(HEADAUDIO + "headworklet.min.mjs");
+  const lipSync = new HeadAudio(context);
+  await lipSync.loadModel(HEADAUDIO + "model-en-mixed.bin");
+  speech.connect(lipSync);
+  lipSync.onvalue = onvalue;
+  return lipSync;
+}
+
+function arkitFromVisemes(visemes) {
+  const arkit = {};
+  for (const [viseme, weight] of Object.entries(visemes)) {
+    for (const [control, amount] of Object.entries(VISEME_TO_ARKIT[viseme] ?? {})) {
+      arkit[control] = Math.min(1, (arkit[control] ?? 0) + weight * amount);
+    }
+  }
+  return arkit;
+}
+
+// How closed the eyes are, 0 to 1: a blink every 2.5 to 5.5 seconds, 60 ms down and 90 ms up, like a relaxed person.
+function blinker() {
+  let blinkAt = performance.now() + 3000;
+  return (now) => {
+    const since = now - blinkAt;
+    if (since > 150) blinkAt = now + 2500 + Math.random() * 3000;
+    if (since < 0) return 0;
+    return since < 60 ? since / 60 : Math.max(0, 1 - (since - 60) / 90);
+  };
+}
+
+function showProgress(event) {
+  if (event.lengthComputable) faceInfo.textContent = `Loading face ${Math.round((event.loaded / event.total) * 100)}%`;
+}
+
+function setStatus(state, text) {
+  dot.className = state;
+  statusText.textContent = text;
+  face?.setState(state);
+}
+
+function addMessage(role, text) {
+  const element = document.createElement("div");
+  element.className = `message ${role}`;
+  const body = document.createElement("div");
+  body.textContent = text;
+  element.append(body);
+  log.prepend(element);
+  return element;
+}
+
+async function start() {
+  // Set up playback first, while the click still counts as a user gesture for audio.
+  const context = face?.context ?? new AudioContext();
+  playback = { context, input: face?.input ?? context.destination, delay: face?.delay ?? 0 };
+  await context.resume();
+  face?.start();
+
+  socket = new WebSocket(`ws://${location.host}/talk`);
+  socket.binaryType = "arraybuffer";
+  socket.onmessage = onMessage;
+  socket.onclose = () => stop("Disconnected");
+  await new Promise((resolve) => (socket.onopen = resolve));
+
+  microphone = await navigator.mediaDevices.getUserMedia({
+    audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+  });
+  captureContext = new AudioContext({ sampleRate: 16000 });
+  const workletUrl = URL.createObjectURL(new Blob([CAPTURE_WORKLET], { type: "application/javascript" }));
+  await captureContext.audioWorklet.addModule(workletUrl);
+  const capture = new AudioWorkletNode(captureContext, "capture");
+  capture.port.onmessage = (event) => socket.readyState === WebSocket.OPEN && socket.send(event.data);
+  captureContext.createMediaStreamSource(microphone).connect(capture);
+  // A worklet only runs when the graph pulls it; it outputs silence.
+  capture.connect(captureContext.destination);
+
+  send({ type: "barge_in", value: bargeIn.checked });
+  startButton.textContent = "Stop";
+  startButton.className = "stop";
+  faceChoice.disabled = true;
+  setStatus("listening", "Listening");
+}
+
+function stop(reason = "Stopped") {
+  stopPlayback();
+  microphone?.getTracks().forEach((track) => track.stop());
+  captureContext?.close();
+  if (playback && !face) playback.context.close();
+  if (socket?.readyState === WebSocket.OPEN) socket.close();
+  socket = microphone = captureContext = playback = null;
+  startButton.textContent = "Start talking";
+  startButton.className = "";
+  faceChoice.disabled = false;
+  setStatus("", reason);
+}
+
+function send(event) {
+  if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify(event));
+}
+
+function onMessage(message) {
+  if (message.data instanceof ArrayBuffer) return play(message.data);
+  const event = JSON.parse(message.data);
+  switch (event.type) {
+    case "busy":
+      stop("Another tab is already talking to the assistant");
+      break;
+    case "user_speaking":
+      setStatus("speaking-user", "Hearing you");
+      break;
+    case "ignored":
+      setStatus("listening", "Listening");
+      break;
+    case "user":
+      addMessage("user", event.text);
+      currentReply = null;
+      setStatus("thinking", "Thinking");
+      break;
+    case "assistant":
+      currentReply ??= addMessage("assistant", "");
+      currentReply.firstChild.textContent += (currentReply.firstChild.textContent ? " " : "") + event.text;
+      break;
+    case "metrics":
+      pendingMetrics = event;
+      break;
+    case "stop":
+      stopPlayback();
+      break;
+    case "done":
+      if (!playing.size) setStatus("listening", "Listening");
+      break;
+    case "error":
+      addMessage("assistant", `Error: ${event.message}`);
+      setStatus("listening", "Listening");
+      break;
+  }
+}
+
+function play(data) {
+  if (!playback) return;
+  const { context } = playback;
+  const pcm = new Int16Array(data);
+  const buffer = context.createBuffer(1, pcm.length, config.sample_rate);
+  const channel = buffer.getChannelData(0);
+  for (let i = 0; i < pcm.length; i++) channel[i] = pcm[i] / 32768;
+
+  const source = context.createBufferSource();
+  source.buffer = buffer;
+  source.connect(playback.input);
+  const startAt = Math.max(context.currentTime + 0.02, nextPlayTime);
+  source.start(startAt);
+  nextPlayTime = startAt + buffer.duration;
+  playing.add(source);
+  source.onended = () => {
+    playing.delete(source);
+    if (!playing.size) setPlaying(false);
+  };
+  setPlaying(true);
+
+  if (pendingMetrics) {
+    const deviceSeconds = context.outputLatency || context.baseLatency || 0;
+    showTiming(pendingMetrics, (startAt - context.currentTime + playback.delay + deviceSeconds) * 1000);
+    pendingMetrics = null;
+  }
+}
+
+function showTiming(metrics, playoutMs) {
+  const total = Math.round(metrics.total_ms + playoutMs);
+  const timing = document.createElement("div");
+  timing.className = "timing";
+  timing.textContent =
+    `${total} ms until you heard it · pause ${metrics.wait_ms} · stt ${metrics.stt_ms} · ` +
+    `llm ${metrics.llm_first_token_ms} · first clause ${metrics.first_piece_ms} · voice ${metrics.tts_first_audio_ms} · ` +
+    `playout ${Math.round(playoutMs)}`;
+  currentReply?.append(timing);
+}
+
+function setPlaying(value) {
+  if (value === isPlaying) return;
+  isPlaying = value;
+  if (value) setStatus("speaking", "Speaking");
+  else if (socket) setStatus("listening", "Listening");
+  send({ type: "playing", value });
+}
+
+function stopPlayback() {
+  for (const source of playing) source.stop();
+  playing.clear();
+  nextPlayTime = 0;
+  pendingMetrics = null;
+  setPlaying(false);
+}
+
+startButton.onclick = () => (socket ? stop() : start().catch((error) => stop(error.message)));
+bargeIn.onchange = () => send({ type: "barge_in", value: bargeIn.checked });
+faceChoice.onchange = () => {
+  const url = new URL(location.href);
+  url.searchParams.set("face", faceChoice.value);
+  location.assign(url);
+};
+</script>
+</body>
+</html>

@@ -1,0 +1,14 @@
+[project]
+name = "thin-voice"
+version = "0.1.0"
+description = "A local voice assistant small enough for an 8 GB laptop"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "aiohttp>=3.14.3",
+    "moonshine-voice>=0.1.5",
+    "numpy>=2.5.3",
+    "onnxruntime>=1.30.0",
+    "pocket-tts>=3.3.0",
+    "supertonic>=1.3.1",
+]
